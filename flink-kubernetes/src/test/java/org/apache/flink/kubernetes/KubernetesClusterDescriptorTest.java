@@ -31,6 +31,7 @@ import org.apache.flink.configuration.JobManagerOptions;
 import org.apache.flink.configuration.PipelineOptions;
 import org.apache.flink.configuration.RestOptions;
 import org.apache.flink.configuration.TaskManagerOptions;
+import org.apache.flink.kubernetes.artifact.DefaultKubernetesArtifactUploader;
 import org.apache.flink.kubernetes.configuration.KubernetesConfigOptions;
 import org.apache.flink.kubernetes.configuration.KubernetesDeploymentTarget;
 import org.apache.flink.kubernetes.kubeclient.Fabric8FlinkKubeClient;
@@ -52,6 +53,7 @@ import java.util.concurrent.Executors;
 
 import static org.apache.flink.kubernetes.utils.Constants.ENV_FLINK_POD_IP_ADDRESS;
 import static org.assertj.core.api.Assertions.assertThat;
+import static org.assertj.core.api.Assertions.assertThatNoException;
 import static org.assertj.core.api.Assertions.assertThatThrownBy;
 
 /** Tests for the {@link KubernetesClusterDescriptor}. */
@@ -203,6 +205,80 @@ class KubernetesClusterDescriptorTest extends KubernetesClientTestBase {
                                 assertThat(cause)
                                         .isInstanceOf(IllegalArgumentException.class)
                                         .hasMessageContaining("Should only have one jar"));
+    }
+
+    @Test
+    void testDeployApplicationClusterWithNoJar() {
+        flinkConfig.set(DeploymentOptions.TARGET, KubernetesDeploymentTarget.APPLICATION.getName());
+        assertThatNoException()
+                .isThrownBy(
+                        () -> descriptor.deployApplicationCluster(clusterSpecification, appConfig));
+    }
+
+    @Test
+    void testDeployApplicationClusterFromSystemClassPathKeepsJarsUnset() throws Exception {
+        flinkConfig.set(DeploymentOptions.TARGET, KubernetesDeploymentTarget.APPLICATION.getName());
+        final ApplicationConfiguration application =
+                new ApplicationConfiguration(
+                        new String[] {"--message", "hello"}, "example.ImageApplication");
+
+        try (ClusterClient<String> clusterClient =
+                descriptor
+                        .deployApplicationCluster(clusterSpecification, application)
+                        .getClusterClient()) {
+            assertThat(clusterClient.getClusterId()).isEqualTo(CLUSTER_ID);
+        }
+
+        // The job is loaded from the image, so no artifact may be introduced on its behalf.
+        assertThat(flinkConfig.getOptional(PipelineOptions.JARS)).isEmpty();
+        assertThat(flinkConfig.get(ApplicationConfiguration.APPLICATION_MAIN_CLASS))
+                .isEqualTo("example.ImageApplication");
+        assertThat(flinkConfig.get(ApplicationConfiguration.APPLICATION_ARGS))
+                .containsExactly("--message", "hello");
+        assertThat(kubeClient.apps().deployments().list().getItems()).hasSize(1);
+    }
+
+    @Test
+    void testDeployApplicationClusterWithEmptyJarsSet() {
+        // An explicitly empty list is a misconfiguration, not a system classpath deployment.
+        flinkConfig.set(PipelineOptions.JARS, Collections.emptyList());
+        flinkConfig.set(DeploymentOptions.TARGET, KubernetesDeploymentTarget.APPLICATION.getName());
+        assertThatThrownBy(
+                        () -> descriptor.deployApplicationCluster(clusterSpecification, appConfig))
+                .isInstanceOf(IllegalArgumentException.class)
+                .hasMessageContaining("Should only have one jar");
+        assertThat(kubeClient.apps().deployments().list().getItems()).isEmpty();
+    }
+
+    @Test
+    void testDeployApplicationClusterFromSystemClassPathWithUploadEnabled() {
+        // The artifact uploader still requires a primary JAR, so the combination must fail
+        // before any cluster resource is created rather than deploy something unusable.
+        flinkConfig.set(DeploymentOptions.TARGET, KubernetesDeploymentTarget.APPLICATION.getName());
+        flinkConfig.set(KubernetesConfigOptions.LOCAL_UPLOAD_ENABLED, true);
+        flinkConfig.set(KubernetesConfigOptions.LOCAL_UPLOAD_TARGET, "file:///tmp/flink-artifacts");
+
+        final KubernetesClusterDescriptor uploadingDescriptor =
+                new KubernetesClusterDescriptor(
+                        flinkConfig,
+                        new FlinkKubeClientFactory() {
+                            @Override
+                            public FlinkKubeClient fromConfiguration(
+                                    Configuration flinkConfig, String useCase) {
+                                return new Fabric8FlinkKubeClient(
+                                        flinkConfig,
+                                        server.createClient().inNamespace(NAMESPACE),
+                                        Executors.newSingleThreadScheduledExecutor());
+                            }
+                        },
+                        new DefaultKubernetesArtifactUploader());
+
+        assertThatThrownBy(
+                        () ->
+                                uploadingDescriptor.deployApplicationCluster(
+                                        clusterSpecification, appConfig))
+                .isInstanceOf(ClusterDeploymentException.class);
+        assertThat(kubeClient.apps().deployments().list().getItems()).isEmpty();
     }
 
     @Test
